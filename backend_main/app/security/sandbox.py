@@ -93,6 +93,10 @@ class WorkspaceManager:
         shutil.copytree(src, root, ignore=shutil.ignore_patterns(*COPY_IGNORE), symlinks=True)
         if not (root / ".git").exists():
             _git(root, "init", "-q")
+        # Store files byte-for-byte. With core.autocrlf=true (the Windows default) the baseline would hold
+        # converted line endings, and comparing it with the real repository would show every file as changed.
+        _git(root, "config", "core.autocrlf", "false")
+        _git(root, "config", "core.safecrlf", "false")
         _git(root, "add", "-A")
         _git(root, "commit", "-q", "--allow-empty", "-m", "DevPilot baseline")
         baseline = _git(root, "rev-parse", "HEAD")

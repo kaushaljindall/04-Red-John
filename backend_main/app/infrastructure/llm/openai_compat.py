@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import httpx
 
 from app.core.errors import ExternalServiceError
-from app.infrastructure.llm.types import ChatRequest, ChatResponse, ToolCall, ToolCallRejected, Usage
+from app.infrastructure.llm.types import ChatRequest, ChatResponse, ContextTooLarge, ToolCall, ToolCallRejected, Usage
 
 log = logging.getLogger(__name__)
 
@@ -49,11 +49,13 @@ class OpenAICompatibleProvider:
         timeout_s: float = 90.0,
         max_attempts: int = 12,
         max_cooldown_wait_s: float = 20.0,
+        rate_limit_budget_s: float = 90.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.name = name
         # Longer than this and every key is effectively out: fail so the gateway can try another provider.
         self._max_cooldown_wait_s = max_cooldown_wait_s
+        self._rate_limit_budget_s = rate_limit_budget_s
         self._keys = [_Key(k) for k in api_keys if k]
         self._max_attempts = max_attempts
         self._http = httpx.AsyncClient(
@@ -78,7 +80,7 @@ class OpenAICompatibleProvider:
         if wait > self._max_cooldown_wait_s:
             raise ExternalServiceError(
                 f"{self.name}: all {len(self._keys)} key(s) are rate limited or rejected for another {wait:.0f}s")
-        log.warning("[%s] all %d keys cooling down; waiting %.1fs", self.name, len(self._keys), wait)
+        log.info("[%s] all %d keys cooling down; waiting %.1fs", self.name, len(self._keys), wait)
         await asyncio.sleep(wait)
         return soonest
 
@@ -104,7 +106,8 @@ class OpenAICompatibleProvider:
             error = response.json().get("error") or {}
         except ValueError:
             return None
-        if error.get("code") != "tool_use_failed":
+        # Both mean the model's own output was malformed, not the request: the agent should try again.
+        if error.get("code") not in ("tool_use_failed", "output_parse_failed"):
             return None
         return ToolCallRejected(str(error.get("message", "tool call rejected"))[:800],
                                 str(error.get("failed_generation", ""))[:800])
@@ -163,7 +166,12 @@ class OpenAICompatibleProvider:
             raise ExternalServiceError(f"{self.name}: no API keys configured")
         payload = self._payload(request, model)
         last_error = ""
-        for attempt in range(1, self._max_attempts + 1):
+        # Rate limits are bounded by total waiting time, not by attempts: with a big key pool a burst of
+        # 429s with short cooldowns is normal and must not look like an outage.
+        attempt, rate_limited_since = 0, None
+        while attempt < self._max_attempts:
+            if rate_limited_since is not None and time.monotonic() - rate_limited_since > self._rate_limit_budget_s:
+                raise ExternalServiceError(f"{self.name}: still rate limited after {self._rate_limit_budget_s:.0f}s")
             key = await self._healthy_key()
             try:
                 response = await self._http.post(
@@ -172,6 +180,7 @@ class OpenAICompatibleProvider:
                     headers={"Authorization": f"Bearer {key.secret}"},
                 )
             except httpx.TransportError as exc:
+                attempt += 1
                 last_error = f"transport error: {exc}"
                 await asyncio.sleep(min(2**attempt, 10))
                 continue
@@ -181,9 +190,11 @@ class OpenAICompatibleProvider:
             if response.status_code == 429:
                 wait = self._retry_after(response)
                 key.cooldown_until = time.monotonic() + wait
-                log.warning("[%s] key %s rate limited; benched %.1fs", self.name, key.preview, wait)
+                rate_limited_since = rate_limited_since or time.monotonic()
+                log.info("[%s] key %s rate limited; benched %.1fs", self.name, key.preview, wait)
                 last_error = "rate limited"
                 continue
+            attempt += 1
             if response.status_code in (401, 403):
                 key.cooldown_until = time.monotonic() + 86_400
                 log.error("[%s] key %s rejected (%s); benched", self.name, key.preview, response.status_code)
@@ -193,6 +204,8 @@ class OpenAICompatibleProvider:
                 last_error = f"server error {response.status_code}"
                 await asyncio.sleep(min(2**attempt, 10))
                 continue
+            if response.status_code == 413 or "context_length_exceeded" in response.text:
+                raise ContextTooLarge(f"{self.name}: request too large — {response.text[:300]}")
             rejected = self._tool_call_rejection(response)
             if rejected is not None:
                 raise rejected

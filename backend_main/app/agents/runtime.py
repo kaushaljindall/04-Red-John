@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.agents.prompts import briefing, system_prompt
@@ -24,7 +24,7 @@ from app.domain.agents import AgentDefinition, AgentRunResult, RunStatus
 from app.domain.events import EventKind, LogLevel
 from app.domain.mission import Task
 from app.infrastructure.llm.gateway import LLMGateway
-from app.infrastructure.llm.types import ChatRequest, ModelTier, ToolCallRejected
+from app.infrastructure.llm.types import ChatRequest, ContextTooLarge, ModelTier, ToolCallRejected
 from app.security.sandbox import WorkspaceManager
 from app.services.event_publisher import EventPublisher
 from app.services.governance import Governor
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 FINISH_TOOL = "finish"
 MAX_NUDGES = 2
 MAX_REJECTED_CALLS = 3
-HISTORY_CHAR_BUDGET = 90_000
+HISTORY_CHAR_BUDGET = 48_000   # ~12k tokens: keeps each call cheap and inside per-key rate limits
 
 FINISH_SCHEMA: dict[str, Any] = {
     "type": "function",
@@ -56,11 +56,37 @@ FINISH_SCHEMA: dict[str, Any] = {
 }
 
 
+def canonical_tool_name(name: str, granted: list[str]) -> str:
+    """gpt-oss was trained with built-in tool namespaces and sometimes prefixes our tools with them
+    (`repo_browser.list_dir`, `functions.read_file`). Strip a prefix when what remains is a real tool."""
+    if name in granted or name == FINISH_TOOL:
+        return name
+    tail = name.rsplit(".", 1)[-1].strip()
+    return tail if tail in granted or tail == FINISH_TOOL else name
+
+
+def compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Drop per-parameter descriptions and shorten the tool description: same contract, fewer tokens."""
+    function = dict(schema["function"])
+    parameters = dict(function.get("parameters") or {})
+    parameters["properties"] = {
+        name: {k: v for k, v in spec.items() if k != "description"}
+        for name, spec in (parameters.get("properties") or {}).items()
+    }
+    function["parameters"] = parameters
+    description = function.get("description", "")
+    function["description"] = description if len(description) <= 220 else description[:217] + "…"
+    return {**schema, "function": function}
+
+
 def _size(message: dict[str, Any]) -> int:
     return len(json.dumps(message, default=str))
 
 
-def trim_history(messages: list[dict[str, Any]], budget: int = HISTORY_CHAR_BUDGET, keep_groups: int = 3) -> list[dict[str, Any]]:
+def trim_history(
+    messages: list[dict[str, Any]], budget: int = HISTORY_CHAR_BUDGET, keep_groups: int = 3,
+    digest: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Drop the oldest steps until the history fits. A step is an assistant message plus the tool
     results that answer it, so a tool result is never left without the call it belongs to."""
     head, rest = messages[:2], messages[2:]
@@ -78,8 +104,13 @@ def trim_history(messages: list[dict[str, Any]], budget: int = HISTORY_CHAR_BUDG
         dropped += 1
     if not dropped:
         return messages
-    note = {"role": "user", "content": f"[context note] {dropped} earlier step(s) were removed to save space. "
-                                       "Use mission_state or re-read files if you need them again."}
+    text = (f"[context note] {dropped} earlier step(s) were removed to save space. Use mission_state or "
+            "re-read files if you need them again.")
+    if digest:
+        # The agent keeps a one-line memory of everything it did, so trimming never makes it redo work.
+        lines = digest[-25:]
+        text += " What you have done so far this run (do not repeat it):\n" + "\n".join(lines)
+    note = {"role": "user", "content": text}
     return head + [note] + [m for g in groups for m in g]
 
 
@@ -90,6 +121,12 @@ class _RunState:
     tokens: int = 0
     nudges: int = 0
     rejected: int = 0
+    warned: bool = False
+    digest: list[str] = field(default_factory=list)   # one line per tool call: the agent's memory of this run
+    # Context budget for this run (characters), and how far it has been shrunk after 413s.
+    budget_chars: int = HISTORY_CHAR_BUDGET
+    result_limit: int = 12_000
+    shrink: float = 1.0
 
 
 class AgentRuntime:
@@ -143,15 +180,23 @@ class AgentRuntime:
         finish = {**FINISH_SCHEMA, "function": {**FINISH_SCHEMA["function"],
                                                  "parameters": nullable_optionals(FINISH_SCHEMA["function"]["parameters"])}}
         schemas = self._tools.schemas(granted) + [finish]
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt(definition, mandate)},
-            {"role": "user", "content": briefing(mission, task, inbox, instructions)},
-        ]
+        # Fit every request under the provider's per-request limit: tool schemas and the system prompt are
+        # fixed costs; the briefing, history and tool results share what is left.
+        s = self._settings
+        budget = int((s.llm_max_request_tokens - s.llm_max_output_tokens) * s.llm_chars_per_token)
+        if len(json.dumps(schemas)) > budget * 0.4:
+            schemas = [compact_schema(x) for x in schemas]
+        system = system_prompt(definition, mandate)
+        room = max(4_000, budget - len(json.dumps(schemas)) - len(system))
+        brief = briefing(mission, task, inbox, instructions)
+        if len(brief) > room // 2:
+            brief = brief[: room // 2 - 120] + "\n… [briefing shortened to fit; use mission_state for the full board]"
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system}, {"role": "user", "content": brief}]
 
         what = task.title if task else (instructions or "Working")[:80]
         await self._events.publish(mission_id, EventKind.START, {"agent": definition.name, "task": what,
                                                                  "team": definition.team, "task_id": task_id})
-        state = _RunState()
+        state = _RunState(budget_chars=room + len(system), result_limit=max(1_500, min(12_000, room // 4)))
         evidence_ids: list[str] = []
         result: AgentRunResult | None = None
         try:
@@ -198,20 +243,43 @@ class AgentRuntime:
             if exhausted:
                 return done(RunStatus.BLOCKED, f"Mission budget exhausted: {exhausted}", stop_reason="budget")
 
-            messages[:] = trim_history(messages)
+            remaining = definition.max_iterations - state.iterations
+            if remaining < 3 and not state.warned:
+                state.warned = True
+                messages.append({"role": "user", "content": (
+                    f"You have {remaining + 1} step(s) left. Call `finish` now with what you have found or done "
+                    "(status blocked or failed if your work is incomplete, and say what is missing).")})
+            messages[:] = trim_history(messages, budget=int(state.budget_chars * state.shrink),
+                                       keep_groups=2 if state.shrink == 1.0 else 1, digest=state.digest)
             try:
                 response = await self._llm.complete(ChatRequest(
-                    messages=messages, tools=schemas, tier=ModelTier(definition.tier), caller=definition.name))
+                    messages=messages, tools=schemas, tier=ModelTier(definition.tier), caller=definition.name,
+                    max_tokens=self._settings.llm_max_output_tokens))
+            except ContextTooLarge as exc:
+                # Sending the same thing again can never work: send less.
+                state.rejected += 1
+                state.shrink *= 0.6
+                state.result_limit = max(1_000, int(state.result_limit * 0.6))
+                if state.rejected > MAX_REJECTED_CALLS:
+                    return done(RunStatus.FAILED, f"Context still too large after trimming: {exc.message[:200]}",
+                                stop_reason="context_too_large")
+                continue
             except ToolCallRejected as exc:
-                # The provider refused the model's own malformed call. Show it the error and let it try again.
+                # The provider refused the model's own malformed call. If what it tried to send is a complete
+                # result (gpt-oss sometimes "calls" a tool named json), take it; otherwise show it the error.
+                verdict = self._finish_from_text(definition, exc.failed_generation)
+                if verdict is not None:
+                    status, summary, data = verdict
+                    return done(status, summary, data=data)
                 state.rejected += 1
                 if state.rejected > MAX_REJECTED_CALLS:
                     return done(RunStatus.FAILED, f"Repeated malformed tool calls: {exc.message}",
                                 stop_reason="tool_call_rejected")
                 messages.append({"role": "user", "content": (
                     f"Your last tool call was rejected before it ran: {exc.message}\n"
-                    "Use the exact tool name, send arguments that match its schema, and leave out optional "
-                    "arguments you do not need.")})
+                    f"Your tools are: {', '.join([*granted, FINISH_TOOL])}. Use one of these exact names, send "
+                    "arguments that match its schema, and leave out optional arguments you do not need. "
+                    "To hand back your result, call `finish`.")})
                 continue
             except ExternalServiceError as exc:
                 return done(RunStatus.FAILED, f"The language model was unavailable: {exc.message}",
@@ -240,6 +308,7 @@ class AgentRuntime:
                 continue
 
             for call in response.tool_calls:
+                call.name = canonical_tool_name(call.name, granted)
                 if call.name == FINISH_TOOL:
                     verdict = self._accept_finish(definition, call.arguments)
                     if isinstance(verdict, str):
@@ -255,7 +324,13 @@ class AgentRuntime:
                     result = await governor.execute(call.name, call.arguments, ctx, allowed=granted)
                     if result.meta.get("evidence_id"):
                         evidence_ids.append(result.meta["evidence_id"])
-                    content = result.to_model_text()
+                    content = result.to_model_text(limit=state.result_limit)
+                    outcome = (result.display or result.error or "done")[:140]
+                    ids = ", ".join(str(v) for k, v in {**result.meta, **(result.content if isinstance(result.content, dict) else {})}.items()
+                                    if k in ("evidence_id", "finding_id", "message_id", "issue_id"))
+                    args = ", ".join(f"{k}={str(v)[:40]}" for k, v in call.arguments.items() if k not in ("content", "new", "old", "body"))
+                    state.digest.append(f"- {call.name}({args}) → {'ok' if result.ok else 'FAILED'}: {outcome}"
+                                        + (f" [{ids}]" if ids else ""))
                     await self._events.log(
                         mission_id,
                         f"{definition.name} → {call.name}: {(result.display or result.error or 'done')[:200]}",
@@ -277,8 +352,14 @@ class AgentRuntime:
             return None
         if not isinstance(payload, dict):
             return None
-        if payload.get("name") == FINISH_TOOL and isinstance(payload.get("arguments"), dict):
+        if isinstance(payload.get("arguments"), dict):
+            # A call written as text or aimed at a tool that does not exist ({"name": "json", "arguments": …}).
             payload = payload["arguments"]
+        required = (definition.output_schema or {}).get("required") or []
+        if ("status" not in payload or "summary" not in payload) and required and all(k in payload for k in required):
+            # A complete result for this role's contract, just not wrapped in finish: accept it as done.
+            payload = {"status": "done", "summary": str(payload.get("summary") or f"{definition.role} result"),
+                       "data": {k: v for k, v in payload.items() if k not in ("status", "summary")}}
         if "status" not in payload or "summary" not in payload:
             return None
         verdict = cls._accept_finish(definition, payload)

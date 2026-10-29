@@ -144,3 +144,13 @@ async def test_budget_limits(storage, events, ctx, registry):
     tokens.record_llm_usage("Atlas", 150)
     assert "token limit" in tokens.exhausted
     assert tokens.budget.snapshot()["tokens_by_agent"] == {"Atlas": 150}
+
+
+async def test_rerunning_a_failed_call_after_the_code_changed_is_not_a_loop(storage, events, ctx, registry):
+    """Found by the orchestrator scenario: the loop guard refused a legitimate test re-run after a fix."""
+    governor = Governor("msn_test", registry, storage.audit, events, MissionLimits(max_identical_failures=2))
+    assert not (await governor.execute("run_tests", {}, ctx)).ok
+    assert not (await governor.execute("run_tests", {}, ctx)).ok
+    assert (await governor.execute("run_tests", {}, ctx)).meta["outcome"] == AuditOutcome.REFUSED_LOOP
+    assert (await governor.execute("edit_file", {"path": "calc.py", "old": "a - b", "new": "a + b"}, ctx)).ok
+    assert (await governor.execute("run_tests", {}, ctx)).ok

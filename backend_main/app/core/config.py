@@ -33,6 +33,11 @@ class BusBackend(StrEnum):
     REDIS = "redis"
 
 
+class ExecutionMode(StrEnum):
+    INLINE = "inline"   # missions run inside the API process (dev, single box)
+    QUEUE = "queue"     # the API enqueues; `python -m app.worker` processes run them
+
+
 def _split_csv(value: object) -> list[str]:
     if value is None:
         return []
@@ -88,6 +93,11 @@ class Settings(BaseSettings):
     llm_max_concurrency: int = 4
     llm_request_timeout_s: float = 90.0
     llm_max_attempts: int = 12
+    # Per-request limits. Groq's on_demand tier rejects any single request above 8,000 tokens (input plus
+    # max_tokens), so agents fit their context to this. Raise it on a paid tier or another provider.
+    llm_max_request_tokens: int = 7800
+    llm_max_output_tokens: int = 2000
+    llm_chars_per_token: float = 3.0       # conservative estimate for JSON-heavy prompts
 
     # ── Sandbox ───────────────────────────────────────────────────
     data_dir: Path = BACKEND_ROOT / "var"
@@ -111,6 +121,20 @@ class Settings(BaseSettings):
     hiring_threshold: float = 0.5
     hiring_llm_mandates: bool = True       # let the LLM write each hire's one-line mandate
     escalate_after_failures: int = 2       # a task failing this often goes to a different specialist
+
+    # ── Orchestration (Atlas) ─────────────────────────────────────
+    orchestrator_max_parallel: int = 3     # tasks run at once when the plan allows it
+    orchestrator_max_rounds: int = 60      # hard stop for one run of the decision loop
+    repair_max_attempts: int = 4           # rounds of fix → re-check before a human is asked
+    llm_retry_backoff_s: float = 5.0       # wait before retrying a task whose model call failed
+
+    # ── Execution (Phase 8) ───────────────────────────────────────
+    # The queue and leases use Redis when BUS_BACKEND=redis, otherwise they are in-process.
+    execution_mode: ExecutionMode = ExecutionMode.INLINE
+    worker_concurrency: int = 4            # missions one worker runs at once
+    lease_ttl_s: float = 60.0              # a runner that stops renewing for this long loses the mission
+    job_claim_after_s: float = 180.0       # a job silent this long is handed to another worker
+    worker_max_deliveries: int = 5         # a mission that crashes its worker this often is failed
 
     @field_validator("groq_api_keys", "gemini_api_keys", "cors_origins", "auto_approve_categories", mode="before")
     @classmethod

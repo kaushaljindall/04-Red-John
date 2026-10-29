@@ -243,3 +243,76 @@ async def test_rejected_tool_call_is_retried_not_fatal(h, registry):
     result = await h.runtime(provider, registry).run(definition(), mid, h.governor(mid, registry))
     assert result.status == RunStatus.DONE
     assert "rejected before it ran" in provider.requests[1].messages[-1]["content"]
+
+
+async def test_rejected_call_carrying_a_complete_result_is_accepted(h, registry):
+    """Seen live: gpt-oss 'called' a tool named json with Kenji's whole result; Groq rejected it 4 times."""
+    from app.infrastructure.llm.types import ToolCallRejected
+
+    mid = await h.mission()
+    kenji = definition("Kenji", "planning", tools=["read_file"],
+                       output_schema={"required": ["objectives", "acceptance_criteria"]})
+    generation = '{"name": "json", "arguments": {"objectives": ["fix add"], "acceptance_criteria": ["tests pass"]}}'
+    provider = ScriptedProvider([ToolCallRejected("attempted to call tool 'json'", generation)])
+    result = await h.runtime(provider, registry).run(kenji, mid, h.governor(mid, registry))
+    assert result.status == RunStatus.DONE and result.data["acceptance_criteria"] == ["tests pass"]
+
+    # A rejected call that is not a complete result gets the list of real tool names back.
+    provider = ScriptedProvider([ToolCallRejected("attempted to call tool 'json'", '{"name": "json", "arguments": {}}'),
+                                 finish(summary="ok", objectives=["a"], acceptance_criteria=["b"])])
+    await h.runtime(provider, registry).run(kenji, mid, h.governor(mid, registry))
+    assert "Your tools are: read_file, finish" in provider.requests[1].messages[-1]["content"]
+
+
+async def test_namespaced_tool_names_are_mapped_to_real_tools(h, registry):
+    """Seen live: gpt-oss called `repo_browser.list_dir`."""
+    from app.agents.runtime import canonical_tool_name
+
+    assert canonical_tool_name("repo_browser.list_dir", ["list_dir"]) == "list_dir"
+    assert canonical_tool_name("functions.finish", []) == "finish"
+    assert canonical_tool_name("repo_browser.open_file", ["read_file"]) == "repo_browser.open_file"
+    mid = await h.mission()
+    provider = ScriptedProvider([reply(call("repo_browser.list_dir", path=".")), finish()])
+    result = await h.runtime(provider, registry).run(definition(tools=["list_dir"]), mid, h.governor(mid, registry))
+    assert result.status == RunStatus.DONE and result.tool_calls == 1
+    assert '"entries"' in provider.requests[1].messages[-1]["content"]
+
+
+async def test_requests_fit_the_provider_limit_and_413_shrinks_context(h, registry, settings):
+    """Seen live: Groq's on_demand tier rejects any request over 8,000 tokens (413), which looked like an outage."""
+    import json
+
+    from app.infrastructure.llm.types import ContextTooLarge
+
+    settings.llm_max_request_tokens, settings.llm_max_output_tokens = 6000, 1500
+    budget_chars = int((6000 - 1500) * settings.llm_chars_per_token)
+    mid = await h.mission()
+    reads = [reply(call("read_file", path="calc.py")) for _ in range(12)]
+    provider = ScriptedProvider([*reads, ContextTooLarge("request too large"), finish()])
+    result = await h.runtime(provider, registry).run(definition(tools=DEV_TOOLS), mid, h.governor(mid, registry))
+    assert result.status == RunStatus.DONE
+    for request in provider.requests:
+        size = len(json.dumps(request.messages)) + len(json.dumps(request.tools))
+        assert size <= budget_chars * 1.05, size
+        assert request.max_tokens == 1500
+    # After the 413 the next request was smaller than the one that was refused.
+    assert len(json.dumps(provider.requests[-1].messages)) < len(json.dumps(provider.requests[-2].messages))
+    # Schemas were compacted to fit: no per-parameter descriptions.
+    assert "description" not in json.dumps(provider.requests[0].tools[0]["function"]["parameters"])
+
+
+async def test_trimmed_agents_keep_a_digest_and_get_a_step_warning(h, registry, settings):
+    """Seen live: with history trimmed, Hana forgot her work and redid it until the iteration limit."""
+    settings.llm_max_request_tokens, settings.llm_max_output_tokens = 5000, 1500
+    mid = await h.mission()
+    steps = [reply(call("run_tests"))] + [reply(call("read_file", path="calc.py")) for _ in range(6)] + [finish()]
+    provider = ScriptedProvider(steps)
+    result = await h.runtime(provider, registry).run(definition(tools=DEV_TOOLS, max_iterations=9), mid,
+                                                     h.governor(mid, registry))
+    assert result.status == RunStatus.DONE
+    notes = [m["content"] for r in provider.requests for m in r.messages
+             if m["role"] == "user" and str(m["content"]).startswith("[context note]")]
+    assert notes and "- run_tests() → FAILED: tests: 1 passed, 1 failed" in notes[-1]
+    assert "evd_" in notes[-1]                                # ids survive in the digest
+    warnings = [m["content"] for m in provider.requests[-1].messages if "step(s) left" in str(m.get("content"))]
+    assert len(warnings) == 1

@@ -42,17 +42,26 @@ class ToolResult:
     def to_model_text(self, limit: int = MAX_MODEL_TEXT) -> str:
         """What the LLM sees as the tool message."""
         evidence_id = self.meta.get("evidence_id")
-        if not self.ok:
-            body = {"ok": False, "error": self.error}
-            if self.content is not None:
-                body["content"] = self.content
-        else:
-            body = {"ok": True, "content": self.content}
-        if evidence_id:
-            body["evidence_id"] = evidence_id  # agents cite this when they claim something is verified
+        prefix = f"[evidence_id: {evidence_id}]\n" if evidence_id else ""
         if self.ok and isinstance(self.content, str):
-            text = (f"[evidence_id: {evidence_id}]\n" if evidence_id else "") + self.content
-        else:
+            body_text = self.content
+            room = limit - len(prefix)
+            if len(body_text) > room:
+                body_text = body_text[: max(0, room - 60)] + f"\n… [truncated {len(body_text) - room + 60} chars]"
+            return prefix + body_text
+        body: dict[str, Any] = {"ok": self.ok}
+        if evidence_id:
+            body["evidence_id"] = evidence_id  # first, so truncation can never cut it off
+        if not self.ok:
+            body["error"] = self.error[: min(1500, limit // 3)]
+        if self.content is not None:
+            body["content"] = self.content
+        text = json.dumps(body, default=str, indent=1)
+        if len(text) > limit and self.content is not None:
+            # Shorten the bulky part (output, file lists), never the verdict or the ids.
+            inner = self.content if isinstance(self.content, str) else json.dumps(self.content, default=str, indent=1)
+            keep = max(200, limit - (len(text) - len(inner)) - 80)
+            body["content"] = inner[:keep] + f"… [truncated {len(inner) - keep} chars]"
             text = json.dumps(body, default=str, indent=1)
         if len(text) > limit:
             text = text[: limit - 60] + f"\n… [truncated {len(text) - limit + 60} chars]"

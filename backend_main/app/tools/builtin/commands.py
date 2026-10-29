@@ -153,8 +153,12 @@ def register(registry: ToolRegistry) -> None:
         folder = _working_dir(ctx, cwd)
         argv = parse_command(command) if command else detect_test_command(folder)
         if not argv:
+            # Recorded as evidence: "this project has no tests" is a fact Atlas plans around (it hires a test author).
             return ToolResult(False, error="No test runner detected (no pytest config, package.json test script, go.mod "
-                                           "or Cargo.toml). Pass 'command' explicitly or report that the project has no tests.")
+                                           "or Cargo.toml). Pass 'command' explicitly or report that the project has no tests.",
+                              evidence={"kind": "test_run", "command": None, "exit_code": None, "passed": False,
+                                        "summary": {"passed": 0, "failed": 0, "errors": 0, "no_runner": True},
+                                        "output_tail": "", "duration_s": 0})
         result = await run_process(argv, folder, timeout_s=ctx.settings.command_timeout_s,
                                    max_output=ctx.settings.command_max_output_chars)
         summary = summarize_test_output(result.combined(), result.exit_code)
@@ -164,7 +168,8 @@ def register(registry: ToolRegistry) -> None:
             passed,
             content=content,
             error="" if passed else ("no tests were collected" if summary["no_tests_collected"] else result.failure_reason()),
-            display=f"tests: {summary['passed']} passed, {summary['failed']} failed, {summary['errors']} errors (exit {result.exit_code})",
+            display=f"tests: {summary['passed']} passed, {summary['failed']} failed, {summary['errors']} errors "
+                    f"(exit {result.exit_code}{', timed out' if result.timed_out else ''}) — {' '.join(argv)[:80]}",
             evidence={
                 "kind": "test_run",
                 "command": " ".join(argv),

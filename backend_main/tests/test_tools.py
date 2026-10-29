@@ -106,3 +106,19 @@ async def test_events_are_published(registry, ctx):
     await registry.execute("run_tests", {}, ctx)
     kinds = [k for k, _ in published]
     assert kinds == [EventKind.TOOL_CALL, EventKind.TOOL_RESULT]  # evidence is the Governor's job
+
+
+def test_truncated_tool_output_keeps_the_evidence_id():
+    """Found when tool output was capped to fit Groq's request limit: the id at the end was cut off."""
+    import json
+
+    from app.tools.registry import ToolResult
+
+    result = ToolResult(False, content={"output": "x" * 5000, "exit_code": 1}, error="exit 1: " + "y" * 3000,
+                        meta={"evidence_id": "evd_123"})
+    text = result.to_model_text(limit=1500)
+    assert len(text) <= 1500
+    body = json.loads(text)
+    assert body["evidence_id"] == "evd_123" and body["ok"] is False and "truncated" in body["content"]
+    ok_text = ToolResult(True, content="z" * 5000, meta={"evidence_id": "evd_9"}).to_model_text(limit=800)
+    assert ok_text.startswith("[evidence_id: evd_9]") and len(ok_text) <= 800

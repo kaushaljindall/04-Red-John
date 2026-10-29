@@ -182,3 +182,27 @@ async def test_nobody_qualified_is_reported_not_faked(setup):
     assert await service.hire(mission.mission_id, request) == []
     logs = [e.data["text"] for e in await storage.events.list(mission.mission_id) if e.kind == EventKind.LOG]
     assert any("could not staff 'audit'" in t for t in logs)
+
+
+def test_test_authoring_tasks_go_to_the_test_author_not_the_scout():
+    """Seen live: Hana (scout) was hired for 'Add edge-case tests for add()'."""
+    engine = HiringEngine(GUILD)
+    m = _mission()
+    task = m.add_task(Task(title="Add edge-case tests for add()", kind=TaskKind.TEST, required_skills=["python"]))
+    assert engine.rank(engine.request_for_task(task, m), hired={"Hana"})[0].agent == "Riku"
+
+
+async def test_sole_specialist_retries_instead_of_escalating(setup):
+    """Seen live: recon failed twice under Hana and nobody else covers recon, so Atlas escalated needlessly."""
+    storage, board, maya, repo = setup
+    mission = await board.create_mission("Fix add()", str(repo))
+    mid = mission.mission_id
+    [recon] = await board.add_tasks(mid, [Task(title="Recon", kind=TaskKind.ANALYSIS, required_skills=["recon"])], by="Atlas")
+    service = maya()
+    assert (await service.staff_task(mid, recon.id)).name == "Hana"
+    await board.assign_task(mid, recon.id, "Hana", by="Atlas")
+    for _ in range(2):
+        await board.update_task(mid, recon.id, TaskStatus.IN_PROGRESS, by="Hana")
+        await board.update_task(mid, recon.id, TaskStatus.FAILED, by="Hana")
+        await board.update_task(mid, recon.id, TaskStatus.PENDING, by="Atlas")
+    assert (await service.staff_task(mid, recon.id)).name == "Hana"

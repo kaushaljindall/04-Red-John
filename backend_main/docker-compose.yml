@@ -1,24 +1,47 @@
-# Scaled-out local stack: API on MongoDB + Redis. A mission worker service
-# joins in Phase 8. For a single-process dev run, just use `uvicorn` with the
-# default in-memory backends instead.
+# Production-shaped stack: stateless API replicas + mission workers, sharing MongoDB, Redis and a
+# workspace volume. Scale either side independently:
+#
+#   docker compose up --build --scale worker=3
+#
+# For a single-process dev run, skip this and use `uvicorn app.main:app` with the in-memory defaults.
+x-devpilot-env: &devpilot-env
+  STORAGE_BACKEND: mongo
+  MONGODB_URL: mongodb://mongo:27017
+  BUS_BACKEND: redis
+  REDIS_URL: redis://redis:6379/0
+  EXECUTION_MODE: queue
+  DATA_DIR: /srv/var
+
 services:
   api:
     build: .
     env_file: .env
-    environment:
-      STORAGE_BACKEND: mongo
-      MONGODB_URL: mongodb://mongo:27017
-      BUS_BACKEND: redis
-      REDIS_URL: redis://redis:6379/0
+    environment: *devpilot-env
     ports:
       - "8000:8000"
     volumes:
-      - workspaces:/srv/var
+      - workspaces:/srv/var          # missions are created here and run by the workers
     depends_on:
       mongo:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  worker:
+    build: .
+    env_file: .env
+    environment: *devpilot-env
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - workspaces:/srv/var
+    # Workers run the target project's tests, so the image needs its toolchain (Python is included;
+    # add Node/Go/… in the Dockerfile for projects that need them).
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 30s            # lets running missions hand their jobs back
 
   mongo:
     image: mongo:7

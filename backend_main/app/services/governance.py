@@ -4,8 +4,10 @@ trail, all enforced in one place — the `Governor` every agent's tool calls
 go through.
 
 Loop detection is ported from Mycel `autonomy/loop_detector.py`, moved down
-to the tool-call level: an agent repeating the exact call that already failed
-is told to change approach instead of being allowed to spin forever.
+to the tool-call level: an agent repeating the exact call that already failed,
+with nothing changed in between, is told to change approach instead of being
+allowed to spin forever. Re-running the tests after someone edits the code is
+not a loop, so a successful edit resets that memory.
 
 One mission runs on one worker at a time (Phase 8 enforces this with a lease),
 so the counters live in memory; every refusal and snapshot is also published
@@ -127,6 +129,11 @@ class LoopDetector:
         record.count += 1
         record.last_error = result.error
 
+    def workspace_changed(self) -> None:
+        """The code changed, so a call that failed before may now succeed: it is not a loop to retry it.
+        (Consecutive-failure streaks are kept: they measure the agent, not the code.)"""
+        self._failures.clear()
+
     def failure_count(self, agent: str, tool: str, args: Any) -> int:
         record = self._failures.get(call_signature(agent, tool, args))
         return record.count if record else 0
@@ -134,6 +141,8 @@ class LoopDetector:
 
 # ── governor ────────────────────────────────────────────────────────────────
 _OUTCOMES = {o.value for o in AuditOutcome}
+# Tools whose success changes the workspace (run_command may too, but cannot be told apart from a read).
+MUTATING_TOOLS = frozenset({"write_file", "edit_file"})
 
 
 class Governor:
@@ -188,6 +197,8 @@ class Governor:
         if result.evidence is not None:
             await self._capture_evidence(ctx, tool, result)
         self.loops.record(ctx.agent, tool, args, result)
+        if result.ok and tool in MUTATING_TOOLS:
+            self.loops.workspace_changed()
         await self._record(ctx, tool, args, result)
         return result
 

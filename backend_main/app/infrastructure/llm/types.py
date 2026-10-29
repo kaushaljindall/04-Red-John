@@ -25,6 +25,15 @@ class ToolCallRejected(Exception):
         self.failed_generation = failed_generation
 
 
+class ContextTooLarge(Exception):
+    """The request exceeds what the provider accepts in one call (e.g. Groq's per-request TPM cap).
+    Retrying the same request can never work; the caller must send less."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 class ToolCall(BaseModel):
     id: str
     name: str

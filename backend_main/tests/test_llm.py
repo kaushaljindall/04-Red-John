@@ -86,3 +86,41 @@ async def test_long_rate_limits_fail_fast_so_the_gateway_can_fall_back():
     gateway = LLMGateway({ModelTier.SMART: [Route(limited, "a"), Route(backup, "b")]})
     response = await asyncio.wait_for(gateway.complete(ChatRequest(messages=[])), timeout=5)
     assert response.content == "served"
+
+
+async def test_a_burst_of_rate_limits_is_not_an_outage():
+    """Seen live: 25 keys, ~45 short 429s in a few seconds, and the provider gave up after 12 'attempts'."""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(429, text="try again in 0.01s") if calls["n"] <= 30 else _ok("finally")
+
+    provider = OpenAICompatibleProvider("groq", "https://x", [f"k{i}" for i in range(5)], max_attempts=3,
+                                        transport=httpx.MockTransport(handler))
+    assert (await provider.complete(ChatRequest(messages=[]), "m")).content == "finally"
+
+
+async def test_rate_limits_are_bounded_by_time_and_network_errors_by_attempts():
+    limited = OpenAICompatibleProvider("groq", "https://x", ["k"], rate_limit_budget_s=0.2,
+                                       transport=httpx.MockTransport(lambda r: httpx.Response(429, text="try again in 0.05s")))
+    with pytest.raises(ExternalServiceError, match="still rate limited"):
+        await asyncio.wait_for(limited.complete(ChatRequest(messages=[]), "m"), timeout=5)
+
+    def down(request):
+        raise httpx.ConnectError("unreachable")
+
+    unreachable = OpenAICompatibleProvider("groq", "https://x", ["k"], max_attempts=2,
+                                           transport=httpx.MockTransport(down))
+    with pytest.raises(ExternalServiceError, match="gave up after 2 attempts"):
+        await asyncio.wait_for(unreachable.complete(ChatRequest(messages=[]), "m"), timeout=15)
+
+
+async def test_output_parse_failed_is_a_rejection():
+    from app.infrastructure.llm.types import ToolCallRejected
+
+    body = {"error": {"code": "output_parse_failed", "message": "Parsing failed", "failed_generation": "We need to"}}
+    provider = OpenAICompatibleProvider("groq", "https://x", ["k"],
+                                        transport=httpx.MockTransport(lambda r: httpx.Response(400, json=body)))
+    with pytest.raises(ToolCallRejected):
+        await provider.complete(ChatRequest(messages=[]), "m")

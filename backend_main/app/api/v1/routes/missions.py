@@ -1,16 +1,17 @@
 """
-Mission endpoints: create and inspect missions, read the board (messages,
+Mission endpoints: create, run and inspect missions, read the board (messages,
 evidence), answer clarification questions, and stop a mission.
-Starting the guild on a mission arrives with the worker in Phase 8.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from fastapi import APIRouter, Query, status
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import ContainerDep
+from app.core.errors import ConflictError
 from app.domain.governance import ApprovalStatus
 from app.domain.mission import MissionStatus
 from app.services.snapshot import build_snapshot
@@ -22,6 +23,7 @@ class CreateMission(BaseModel):
     request: str = Field(min_length=3, max_length=20_000, description="What should be built or fixed, in plain language")
     repo_path: str = Field(min_length=1, description="Local path of the repository to work on")
     title: str | None = Field(default=None, max_length=200)
+    start: bool = Field(default=False, description="Start the guild on the mission right away")
 
 
 class ResolveIssue(BaseModel):
@@ -35,7 +37,9 @@ class StopMission(BaseModel):
 @router.post("/missions", status_code=status.HTTP_201_CREATED)
 async def create_mission(body: CreateMission, container: ContainerDep) -> dict[str, Any]:
     mission = await container.board.create_mission(body.request, body.repo_path, title=body.title)
-    return {"mission": mission.model_dump(mode="json"),
+    if body.start:
+        await container.runner.start(mission.mission_id)
+    return {"mission": mission.model_dump(mode="json"), "running": body.start,
             "stream": f"{container.settings.api_prefix}/realtime/missions/{mission.mission_id}"}
 
 
@@ -94,7 +98,38 @@ async def mission_evidence(
 async def resolve_issue(mission_id: str, issue_id: str, body: ResolveIssue, container: ContainerDep) -> dict[str, Any]:
     """A human answers a clarification question or settles a dispute."""
     issue = await container.board.resolve_issue(mission_id, issue_id, by="operator", resolution=body.resolution)
-    return {"issue": issue.model_dump(mode="json")}
+    mission = await container.board.get(mission_id)
+    resumed = False
+    if (mission.status == MissionStatus.AWAITING_HUMAN and not any(i.needs_human for i in mission.open_issues)
+            and not await container.runner.is_running(mission_id)):
+        await container.runner.start(mission_id)  # every question answered: Atlas picks the mission back up
+        resumed = True
+    return {"issue": issue.model_dump(mode="json"), "resumed": resumed}
+
+
+@router.post("/missions/{mission_id}/run", status_code=status.HTTP_202_ACCEPTED)
+async def run_mission(mission_id: str, container: ContainerDep) -> dict[str, Any]:
+    """Start (or resume) the guild on a mission. Returns at once; follow progress on the event stream."""
+    mission = await container.board.get(mission_id)
+    if mission.is_terminal:
+        raise ConflictError(f"Mission {mission_id} is {mission.status}")
+    await container.runner.start(mission_id)
+    return {"mission_id": mission_id, "running": True, "mode": container.settings.execution_mode}
+
+
+@router.get("/missions/{mission_id}/patch", response_class=PlainTextResponse)
+async def mission_patch(mission_id: str, container: ContainerDep) -> str:
+    """The mission's full change as a unified diff — what a human reviews before approving the apply."""
+    return await container.apply.patch(mission_id)
+
+
+@router.post("/missions/{mission_id}/apply", status_code=status.HTTP_202_ACCEPTED)
+async def request_apply(mission_id: str, container: ContainerDep) -> dict[str, Any]:
+    """Ask to apply a completed mission to the real repository. A human must approve it
+    (POST /approvals/{approval_id}/respond); only then are files written."""
+    approval = await container.apply.request(mission_id, by="operator")
+    return {"approval": approval.model_dump(mode="json"),
+            "respond": f"{container.settings.api_prefix}/approvals/{approval.approval_id}/respond"}
 
 
 @router.post("/missions/{mission_id}/stop")

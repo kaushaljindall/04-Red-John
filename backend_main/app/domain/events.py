@@ -39,6 +39,7 @@ class EventKind(StrEnum):
     CRITERION = "criterion"        # acceptance criterion verified (or not)
     DECISION = "decision"          # Atlas: continue / retry / replan / escalate / stop
     RELEASE = "release"            # Maya releases an agent
+    APPLY = "apply"                # applying the change to the real repository: requested / applied / …
 
 
 class LogLevel(StrEnum):

@@ -15,6 +15,7 @@ Two parts, kept apart on purpose:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 
 from app.agents.guild import AgentRegistry, clearance
@@ -39,6 +40,7 @@ _INFERABLE = AREA_SKILLS | {"security", "refactoring", "test-authoring", "debugg
 # Work that must be done by someone other than whoever wrote the change.
 _INDEPENDENT_KINDS = {TaskKind.VERIFY, TaskKind.REVIEW, TaskKind.SECURITY}
 _AUTHOR_KINDS = {TaskKind.IMPLEMENT, TaskKind.FIX}
+_WRITES_TESTS = re.compile(r"\b(add|write|create|extend|cover)\b[^.\n]{0,60}\btests?\b", re.I)
 # Hired at the start of every mission: the Shogun's Council.
 PLANNING_CORE: tuple[tuple[str, str], ...] = (
     ("requirements", "Turn the request into objectives and acceptance criteria"),
@@ -69,6 +71,8 @@ class HiringEngine:
         text = f"{task.title}\n{task.description}"
         explicit = normalize_skills(task.required_skills)
         kind_skills = KIND_SKILLS.get(task.kind, ())
+        if task.kind == TaskKind.TEST and _WRITES_TESTS.search(text):
+            kind_skills = ("test-authoring",)  # "add edge-case tests for mul()" is authoring, not just running
         if not kind_skills:  # no default for this kind: the first explicit skill is the core need
             kind_skills, explicit = tuple(explicit[:1]), explicit[1:]
         needs = self._needs(
@@ -120,14 +124,14 @@ class HiringEngine:
 
         def key(item: tuple[CandidateScore, AgentDefinition]) -> tuple:
             candidate, definition = item
-            adjusted = candidate.score + (0.05 if candidate.agent in hired else 0.0) - (0.15 if candidate.agent in busy else 0.0)
-            # Among equals prefer the specialist: an agent's first skill is their specialism, then the share
-            # of their skills this work uses.
+            # Fit first; then the right line (first-line vs escalation); then the specialist (an agent's first
+            # skill is their specialism); then someone not busy; then continuity with the current task force;
+            # then the share of their skills this work uses.
             primary = bool(definition.skills) and definition.skills[0] in core
             focus = len(candidate.matched) / max(1, len(definition.skills))
             wrong_line = definition.escalation != request.escalation
-            return (not candidate.eligible, -round(adjusted, 3), wrong_line, not primary, -round(focus, 3),
-                    order[candidate.agent])
+            return (not candidate.eligible, -candidate.score, wrong_line, not primary, candidate.agent in busy,
+                    candidate.agent not in hired, -round(focus, 3), order[candidate.agent])
 
         return [candidate for candidate, _ in sorted(scored, key=key)]
 
@@ -199,17 +203,22 @@ class HiringService:
         task = mission.task(task_id)
         exclude: list[str] = []
         if task.assignee:
-            failed_enough = task.attempts >= self._escalate_after
+            failed_enough = task.failures >= self._escalate_after
             still_hired = task.assignee in mission.hired_agents
             if not failed_enough and still_hired:
                 return self.registry.require(task.assignee)
             if failed_enough:
                 # New evidence (repeated failure) changes who does the work.
                 exclude.append(task.assignee)
-                await self._events.log(mission_id, f"Maya: '{task.title}' failed {task.attempts} time(s) under "
+                await self._events.log(mission_id, f"Maya: '{task.title}' failed {task.failures} time(s) under "
                                                    f"{task.assignee}; bringing in a different specialist.", LogLevel.ACTION)
         request = self.engine.request_for_task(task, mission, exclude=exclude, escalation=bool(exclude))
         records = await self.hire(mission_id, request, busy=busy)
+        if not records and exclude and task.assignee in mission.hired_agents:
+            # Nobody else has the skill: the current specialist tries again (still bounded by attempts).
+            await self._events.log(mission_id, f"Maya: nobody else covers '{task.title}'; {task.assignee} "
+                                               "tries again.", LogLevel.ACTION)
+            return self.registry.require(task.assignee)
         if not records:
             return None
         return self.registry.require(records[0].agent)

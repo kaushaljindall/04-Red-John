@@ -23,6 +23,7 @@ from app.domain.hiring import HireRecord
 from app.domain.mission import (
     AcceptanceCriterion,
     AgentMessage,
+    ApplyRecord,
     CriterionStatus,
     Decision,
     Evidence,
@@ -57,6 +58,10 @@ def evidence_verdict(kind: str, data: dict[str, Any]) -> bool | None:
 def _summarize(kind: str, data: dict[str, Any]) -> str:
     if kind == "test_run":
         s = data.get("summary", {})
+        if s.get("no_runner"):
+            return "no test runner detected — the project has no runnable tests"
+        if s.get("no_tests_collected"):
+            return f"{data.get('command', 'tests')}: no tests were collected (exit {data.get('exit_code')})"
         return (f"{data.get('command', 'tests')}: {s.get('passed', 0)} passed, {s.get('failed', 0)} failed, "
                 f"{s.get('errors', 0)} errors (exit {data.get('exit_code')})")
     if kind == "diff":
@@ -64,6 +69,24 @@ def _summarize(kind: str, data: dict[str, Any]) -> str:
     if kind in ("secret_scan", "static_scan"):
         return f"{kind}: {data.get('count', 0)} finding(s) in {data.get('scope', 'repository')}"
     return kind
+
+
+def _dependency_order(tasks: list[Task]) -> list[Task]:
+    batch = {t.id: t for t in tasks}
+    placed: list[Task] = []
+    seen: set[str] = set()
+    remaining = list(tasks)
+    while remaining:
+        progressed = False
+        for task in list(remaining):
+            if all(d in seen or d not in batch for d in task.depends_on):
+                placed.append(task)
+                seen.add(task.id)
+                remaining.remove(task)
+                progressed = True
+        if not progressed:  # a cycle inside the batch: keep the given order and let the mission reject it
+            return placed + remaining
+    return placed
 
 
 def _title_from(request: str) -> str:
@@ -154,9 +177,13 @@ class MissionBoard:
         return mission
 
     async def add_tasks(self, mission_id: str, tasks: list[Task], *, by: str) -> list[Task]:
+        """Add a batch of tasks. Dependencies inside the batch may point either way; tasks are added in
+        dependency order (a cycle or an unknown dependency is rejected by the mission)."""
+        ordered = _dependency_order(tasks)
+
         def change(m: Mission) -> list[Task]:
             added = []
-            for task in tasks:
+            for task in ordered:
                 task = task.model_copy(deep=True, update={"created_by": task.created_by if task.created_by != "system" else by})
                 added.append(m.add_task(task))
             return added
@@ -190,10 +217,11 @@ class MissionBoard:
         return task
 
     async def set_task_details(
-        self, mission_id: str, task_id: str, *, by: str, description: str | None = None, max_attempts: int | None = None
+        self, mission_id: str, task_id: str, *, by: str, description: str | None = None,
+        max_attempts: int | None = None, add_failure: bool = False,
     ) -> Task:
-        _, task = await self.mutate(
-            mission_id, lambda m: m.set_task_details(task_id, description=description, max_attempts=max_attempts))
+        _, task = await self.mutate(mission_id, lambda m: m.set_task_details(
+            task_id, description=description, max_attempts=max_attempts, add_failure=add_failure))
         await self._publish_task(mission_id, task, by=by, action="details")
         return task
 
@@ -204,6 +232,11 @@ class MissionBoard:
                 m.touch()
 
         await self.mutate(mission_id, change)
+
+    async def record_application(self, mission_id: str, record: ApplyRecord) -> Mission:
+        mission, _ = await self.mutate(mission_id, lambda m: m.record_application(record))
+        await self._events.publish(mission_id, EventKind.APPLY, record.model_dump(mode="json"))
+        return mission
 
     async def set_report(self, mission_id: str, report: str) -> None:
         def change(m: Mission) -> None:

@@ -163,8 +163,9 @@ class Task(BaseModel):
     required_skills: list[str] = Field(default_factory=list)
     criteria_ids: list[str] = Field(default_factory=list)
     assignee: str | None = None
-    attempts: int = 0
+    attempts: int = 0           # times the task was started (checks legitimately re-run after code changes)
     max_attempts: int = 3
+    failures: int = 0           # times it failed, or a repair round did not fix the problem
     result_summary: str | None = None
     # Why Atlas created this task: "bootstrap:requirements", "gate:review", "repair:<task id>",
     # "arbitrate:<finding id>"… None for tasks from the planner.
@@ -214,6 +215,28 @@ class OpenIssue(BaseModel):
 
 
 # ── aggregate ───────────────────────────────────────────────────────────────
+class ApplyStatus(StrEnum):
+    REQUESTED = "requested"     # waiting for a human to approve
+    APPLIED = "applied"
+    REJECTED = "rejected"       # the human said no
+    FAILED = "failed"           # approved, but the repository changed underneath (nothing was written)
+
+
+class ApplyRecord(BaseModel):
+    """Bringing a completed mission's change into the real repository — only after a human approves."""
+
+    status: ApplyStatus
+    approval_id: str
+    requested_by: str
+    requested_at: int = Field(default_factory=now_ms)
+    decided_by: str | None = None
+    decided_at: int | None = None
+    files: list[str] = Field(default_factory=list)
+    patch_path: str | None = None
+    backup_path: str | None = None
+    error: str | None = None
+
+
 class Mission(BaseModel):
     mission_id: str = Field(default_factory=lambda: new_id("msn"))
     title: str
@@ -234,6 +257,7 @@ class Mission(BaseModel):
     inbox_cursors: dict[str, int] = Field(default_factory=dict)
     # The final evidence report (Markdown), written when the mission ends.
     report: str | None = None
+    application: ApplyRecord | None = None
     created_by: str = "operator"
     created_at: int = Field(default_factory=now_ms)
     updated_at: int = Field(default_factory=now_ms)
@@ -264,6 +288,13 @@ class Mission(BaseModel):
             if issue.id == issue_id:
                 return issue
         raise MissionError(f"unknown issue {issue_id}")
+
+    def record_application(self, record: ApplyRecord) -> None:
+        """Allowed after completion: applying is what happens to a finished mission."""
+        if self.status != MissionStatus.COMPLETED:
+            raise MissionError("only a completed mission can be applied to the repository")
+        self.application = record
+        self.touch()
 
     @property
     def hired_agents(self) -> list[str]:
@@ -391,10 +422,13 @@ class Mission(BaseModel):
         return task
 
     def set_task_details(
-        self, task_id: str, *, description: str | None = None, max_attempts: int | None = None
+        self, task_id: str, *, description: str | None = None, max_attempts: int | None = None,
+        add_failure: bool = False,
     ) -> Task:
         self._ensure_active()
         task = self.task(task_id)
+        if add_failure:
+            task.failures += 1
         if description is not None:
             task.description = description
         if max_attempts is not None:
@@ -427,6 +461,8 @@ class Mission(BaseModel):
                 if task_id in dependant.depends_on and dependant.status == TaskStatus.DONE:
                     dependant.status = TaskStatus.PENDING
                     dependant.updated_at = now_ms()
+        if status == TaskStatus.FAILED:
+            task.failures += 1
         task.status = status
         if summary is not None:
             task.result_summary = summary

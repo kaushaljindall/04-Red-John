@@ -12,6 +12,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 from app.api.deps import ContainerDep
+from app.services.apply import APPLY_TOOL
 from app.domain.governance import ApprovalStatus
 
 router = APIRouter(tags=["governance"])
@@ -33,7 +34,12 @@ async def list_approvals(mission_id: str, container: ContainerDep, status: Appro
 async def respond_to_approval(approval_id: str, body: ApprovalDecision, container: ContainerDep) -> dict[str, Any]:
     # Phase 10 replaces "operator" with the authenticated user.
     decided = await container.approvals.resolve(approval_id, body.approved, by="operator", note=body.note)
-    return {"status": "ok", "approval_id": approval_id, "approved": decided.approved, "approval": decided.model_dump(mode="json")}
+    response = {"status": "ok", "approval_id": approval_id, "approved": decided.approved,
+                "approval": decided.model_dump(mode="json")}
+    if decided.tool == APPLY_TOOL:
+        # Nobody is waiting on this approval: the decision itself triggers (or cancels) the apply.
+        response["application"] = (await container.apply.on_decision(decided)).model_dump(mode="json")
+    return response
 
 
 @router.get("/missions/{mission_id}/audit")
