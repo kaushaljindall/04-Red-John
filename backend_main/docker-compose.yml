@@ -1,0 +1,41 @@
+# Scaled-out local stack: API on MongoDB + Redis. A mission worker service
+# joins in Phase 8. For a single-process dev run, just use `uvicorn` with the
+# default in-memory backends instead.
+services:
+  api:
+    build: .
+    env_file: .env
+    environment:
+      STORAGE_BACKEND: mongo
+      MONGODB_URL: mongodb://mongo:27017
+      BUS_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    volumes:
+      - workspaces:/srv/var
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 5
+
+volumes:
+  workspaces:
+  mongo-data:
